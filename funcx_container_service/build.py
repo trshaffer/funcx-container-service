@@ -5,23 +5,26 @@ import tarfile
 import tempfile
 import shutil
 import docker
+import logging
 from pathlib import Path
 from docker.errors import ImageNotFound
 from fastapi import HTTPException
-from . import db
+from . import db, landlord
 from .models import ContainerSpec
 
 
 REPO2DOCKER_CMD = "jupyter-repo2docker --no-run --image-name funcx_{} {}"
-docker_client = docker.APIClient(base_url='unix://var/run/docker.sock')
+DOCKER_BASE_URL = 'unix://var/run/docker.sock'
 
 
 def docker_size(container_id):
+    docker_client = docker.APIClient(base_url=DOCKER_BASE_URL)
     inspect = docker_client.inspect_image(f'funcx_{container_id}')
     return inspect['VirtualSize']
 
 
 def docker_ready(container_id):
+    docker_client = docker.APIClient(base_url=DOCKER_BASE_URL)
     try:
         docker_client.inspect_image(f'funcx_{container_id}')
         return True
@@ -54,7 +57,6 @@ async def build_spec(container_id, spec, tmp_dir):
 async def build_tarball(container_id, tmp_dir, tarball):
     with tarfile.open(tarball) as tar_obj:
         tar_obj.extractall(path=tmp_dir)
-    os.unlink(tarball)
 
     # For some reason literally any file will pass through this tarfile check
     if len(os.listdir(tmp_dir)) == 0:
@@ -74,27 +76,32 @@ async def run_repo2docker(container_id, temp_dir):
                 proc.returncode,
                 Path(out.name),
                 docker_size(container_id))
+        landlord.check_cache()
 
 
-# for specs, extra just indicates whether we need to build
-# for tarballs, it's the path of the tarball
-async def trigger_build(container_id, extra):
-    if not extra:
-        return
-
+async def background_build(container_id, tarball):
     session = db.Session()
     container = session.query(db.Container).filter(db.Container.id == container_id).one()
 
-    if container.specification and container.exit_status is None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        if container.specification and container.exit_status is None:
+            assert(not tarball)
             await build_spec(
                     container_id,
                     ContainerSpec.parse_raw(container.specification),
                     tmp)
-    elif container.tarball and container.exit_status is None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            await build_tarball(container_id, tmp, extra)
-    elif container.tarball:
-        os.unlink(extra)
+        elif container.tarball and container.exit_status is None:
+            assert(tarball)
+            await build_tarball(container_id, tmp, tarball)
+
+    if tarball:
+        os.unlink(tarball)
+
+
+def remove(container_id):
+    client = docker.from_env()
+    try:
+        client.images.remove(f'funcx_{container.id}')
+    except ImageNotFound:
+        logging.warning(f'docker image funcx_{container.id} removed unexpectedly')

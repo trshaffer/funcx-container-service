@@ -24,3 +24,8 @@ $ uvicorn funcx_container_service:app --reload
 ```
 
 The full API is documented at `http://server:port/docs`.
+
+A database needs to be (TBD).
+The Docker daemon needs to be running (with the control socket)
+bind mounted into the container if applicable. Also requires Singularity 3.x
+in the build environment.

@@ -10,13 +10,12 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, func, Column, String, Integer, ForeignKey, LargeBinary, DateTime
+from sqlalchemy import create_engine, func, Column, String, Integer, ForeignKey, LargeBinary, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.pool import StaticPool
 
 from .models import ContainerSpec, StatusResponse
-from . import landlord
 
 
 Base = declarative_base()
@@ -39,7 +38,7 @@ class Container(Base):
     specification = Column(String)
     tarball = Column(LargeBinary)
     docker_size = Column(Integer)
-    singularity_size = Column(Integer)
+    built = Column(Boolean, default=False)
 
     builds = relationship('Build', back_populates='container')
 
@@ -57,7 +56,8 @@ class Build(Base):
 def total_storage():
     session = Session()
     label = 'total_storage'
-    return session.query(Container).with_entities(func.sum(Container.docker_size).label(label)).scalar()
+    storage = session.query(Container).with_entities(func.sum(Container.docker_size).label(label)).scalar()
+    return storage or 0
 
 
 def hash_spec(spec):
@@ -85,6 +85,21 @@ def store_spec(spec):
     return container_id, True
 
 
+def get_spec(build_id):
+    session = Session()
+    for row in session.query(Build).filter(Build.id == build_id):
+        build = row
+        break
+    else:
+        raise HTTPException(status_code=404)
+
+    spec = build.container.specification
+    if not spec:
+        raise HTTPException(status_code=400)
+
+    return json.loads(spec)
+
+
 def hash_tarball(tarball):
     digest = hashlib.sha256()
     with open(tarball, 'rb') as f:
@@ -106,8 +121,7 @@ def store_tarball(tarball):
     container_id = hash_tarball(tmp_path)
 
     for row in session.query(Container).filter(Container.id == container_id):
-        os.unlink(tmp_path)
-        return container_id, False
+        return container_id, tmp_path, False
 
     #XXX upload to S3 or wherever here
     # just stash it in the database for now
@@ -119,12 +133,23 @@ def store_tarball(tarball):
         cont.tarball = f.read()
     session.add(cont)
     session.commit()
-    return container_id, tmp_path
+    return container_id, tmp_path, True
+
+
+def fetch_tarball(container_id):
+    session = Session()
+    container = session.query(Container).filter(Container.id == container_id).one()
+    if not container.tarball:
+        return
+    tmp_fd, tmp_path = tempfile.mkstemp()
+    os.close(tmp_fd)
+    with open(tmp_path, 'wb') as f:
+        f.write(container.tarball)
+    return tmp_path
 
 
 def status(build_id):
     session = Session()
-
     for row in session.query(Build).filter(Build.id == build_id):
         build = row
         break
@@ -157,9 +182,17 @@ def add_build(container_id):
     return build.id
 
 
+def start_build(container_id):
+    session = Session()
+    container = session.query(Container).filter(Container.id == container_id).one()
+    if container.built:
+        return False
+    container.built = True
+    session.commit()
+    return True
+
 def store_build_result(container_id, exit_status, build_log, docker_size):
     session = Session()
-
     container = session.query(Container).filter(Container.id == container_id).one()
     container.exit_status = exit_status
     container.docker_size = docker_size
@@ -168,7 +201,6 @@ def store_build_result(container_id, exit_status, build_log, docker_size):
         container.build_log = f.read()
 
     session.commit()
-    #landlord.check_cache(session)
 
 def get_build_output(build_id):
     session = Session()
@@ -178,6 +210,16 @@ def get_build_output(build_id):
     else:
         raise HTTPException(status_code=404)
     return build.container.build_log
+
+
+def docker_url(build_id):
+    session = Session()
+    for row in session.query(Build).filter(Build.id == build_id):
+        build = row
+        break
+    else:
+        raise HTTPException(status_code=404)
+    return build.container.id, 'TODO aws' if build.container.docker_size else None
 
 
 Base.metadata.create_all(_engine)

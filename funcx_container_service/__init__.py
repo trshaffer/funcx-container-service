@@ -1,54 +1,59 @@
 from uuid import UUID
 from fastapi import FastAPI, UploadFile, File, Response, BackgroundTasks
-from fastapi.responses import FileResponse
 from . import db, build
-from .models import IDResponse, ContainerSpec, StatusResponse
+from .models import ContainerSpec, StatusResponse
 from .dockerfile import emit_dockerfile
 
 app = FastAPI()
 
 
-@app.post("/build", response_model=IDResponse)
+@app.post("/build", response_model=UUID)
 async def simple_build(spec: ContainerSpec, tasks: BackgroundTasks):
     """Build a container based on a JSON specification.
 
     Returns an ID that can be used to query container status.
     """
-    container_id = db.store_spec(spec)
-    tasks.add_task(build.spec, container_id)
-    return {"container_id": container_id}
+    container_id, done = db.store_spec(spec)
+    tasks.add_task(build.trigger_build, container_id, done)
+    return db.add_build(container_id)
 
 
-@app.post("/build_advanced", response_model=IDResponse)
+@app.post("/build_advanced", response_model=UUID)
 async def advanced_build(tasks: BackgroundTasks, repo: UploadFile = File(...)):
     """Build a container using repo2docker.
 
     The repo must be a directory in `.tar.gz` format.
     Returns an ID that can be used to query container status.
     """
-    container_id = db.store_tarball(repo)
-    tasks.add_task(build.tarball, container_id)
-    return {"container_id": container_id}
+    container_id, tmp_path = db.store_tarball(repo.file)
+    tasks.add_task(build.trigger_build, container_id, tmp_path)
+    return db.add_build(container_id)
 
 
-@app.post("/dockerfile")
-def dockerfile(spec: ContainerSpec):
-    """Generate a Dockerfile to build a container for the given specification.
+@app.post("/{build_id}/dockerfile")
+def dockerfile(build_id: UUID):
+    """Generate a Dockerfile to build the given container.
 
+    Does not support "advanced build" (tarball) containers.
     Produces a container that is roughly compatible with repo2docker.
     """
-    return Response(content=emit_dockerfile(spec.apt, spec.conda, spec.pip),
+    return Response(content=emit_dockerfile(str(build_id)),
                     media_type="text/plain")
 
 
-@app.get("/status/{container_id}", response_model=StatusResponse)
-def status(container_id: UUID):
-    """Check the status of a container by ID."""
-    return db.get_status(str(container_id))
+@app.get("/{build_id}/status", response_model=StatusResponse)
+def status(build_id: UUID):
+    """Check the status of a previously submitted build.
+
+    A "build_status" of null indicates that the build is in progress.
+    On success, this status will be 0. On error, it may be helpful to
+    examine /{build_id}/build_log
+    """
+    return db.status(str(build_id))
 
 
-@app.get("/build_log/{container_id}")
-def build_log(container_id: UUID):
+@app.get("/{build_id}/build_log")
+def build_log(build_id: UUID):
     """Get the full build log for a container."""
-    return FileResponse(db.get_build_output(str(container_id)),
-                        media_type="text/plain")
+    return Response(content=db.get_build_output(str(build_id)),
+                    media_type="text/plain")

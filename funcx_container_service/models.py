@@ -1,13 +1,9 @@
 import json
 import hashlib
+from datetime import datetime
 from uuid import UUID
 from typing import Optional, List
 from pydantic import BaseModel, constr
-
-
-class IDResponse(BaseModel):
-    """API response providing a container ID."""
-    container_id: UUID
 
 
 class ContainerSpec(BaseModel):
@@ -35,6 +31,9 @@ class ContainerSpec(BaseModel):
 
 class StatusResponse(BaseModel):
     """API response giving a container's status"""
-    container_id: UUID
-    build_status: Optional[str]
-    return_code: Optional[int]
+    id: UUID
+    recipe_checksum: str
+    last_used: datetime
+    docker_ready: bool
+    docker_size: Optional[int]
+    build_status: Optional[int]

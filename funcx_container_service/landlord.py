@@ -1,5 +1,5 @@
 import docker
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from . import db, build
 from .models import ContainerSpec
 
@@ -23,21 +23,20 @@ def spec_to_set(spec):
     return out
 
 
-def check_cache():
-    return
+def total_storage():
+    with db.session_scope() as session:
+        size = session.query(db.Container).with_entities(func.sum(db.Container.docker_size + db.Container.singularity_size)).scalar()
+        return size or 0
+
+async def cleanup():
     session = db.Session()
 
-    while db.total_storage() > MAX_STORAGE:
+    while total_storage() > MAX_STORAGE:
         container = session.query(db.Container).filter(db.Container.docker_size.isnot(None)).order_by(db.Container.last_used.asc()).first()
-        container.docker_size = None
-        container.exit_status = None
-        container.build_log = None
-        container.built = False
         build.remove(container.id)
         session.commit()
 
 def find_existing(spec):
-    return
     session = db.Session()
 
     target = spec_to_set(spec)

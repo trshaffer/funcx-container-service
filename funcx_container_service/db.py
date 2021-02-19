@@ -162,8 +162,10 @@ def status(build_id):
             last_used=container.last_used,
             docker_url=container.docker_url,
             docker_size=container.docker_size,
+            docker_log=container.docker_log,
             singularity_url=container.singularity_url,
-            singularity_size=container.singularity_size
+            singularity_size=container.singularity_size,
+            singularity_log=container.singularity_log
             )
 
 

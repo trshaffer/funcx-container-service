@@ -40,6 +40,8 @@ class StatusResponse(BaseModel):
     recipe_checksum: str
     last_used: datetime
     docker_url: Optional[AnyUrl]
+    docker_log: Optional[AnyUrl]
     docker_size: Optional[int]
     singularity_url: Optional[AnyUrl]
+    singularity_log: Optional[AnyUrl]
     singularity_size: Optional[int]

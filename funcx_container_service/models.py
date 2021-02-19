@@ -3,7 +3,7 @@ import hashlib
 from datetime import datetime
 from uuid import UUID
 from typing import Optional, List
-from pydantic import BaseModel, constr
+from pydantic import BaseModel, AnyUrl, constr
 
 
 class ContainerSpec(BaseModel):
@@ -24,8 +24,13 @@ class ContainerSpec(BaseModel):
     pip: Optional[List[str]]
     conda: Optional[List[str]]
 
+
     def digest(self):
-        canonical = json.dumps(self.dict(), sort_keys=True)
+        tmp = self.dict()
+        for k, v in tmp.items():
+            if v:
+                v.sort()
+        canonical = json.dumps(tmp, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
 
@@ -34,6 +39,7 @@ class StatusResponse(BaseModel):
     id: UUID
     recipe_checksum: str
     last_used: datetime
-    docker_ready: bool
+    docker_url: Optional[AnyUrl]
     docker_size: Optional[int]
-    build_status: Optional[int]
+    singularity_url: Optional[AnyUrl]
+    singularity_size: Optional[int]

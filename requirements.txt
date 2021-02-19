@@ -4,3 +4,4 @@ python-multipart
 uvicorn
 SQLAlchemy
 docker
+boto3

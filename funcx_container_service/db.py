@@ -8,6 +8,7 @@ import hashlib
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from contextlib import contextmanager
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine, func, Column, String, Integer, ForeignKey, LargeBinary, DateTime, Boolean
@@ -17,6 +18,8 @@ from sqlalchemy.pool import StaticPool
 
 from .models import ContainerSpec, StatusResponse
 
+
+RUN_ID = str(uuid.uuid4())
 
 Base = declarative_base()
 Session = sessionmaker()
@@ -31,14 +34,16 @@ class Container(Base):
     __tablename__ = 'containers'
 
     id = Column(String, primary_key=True)
-
     last_used = Column(DateTime)
-    exit_status = Column(Integer)
-    build_log = Column(LargeBinary)
     specification = Column(String)
-    tarball = Column(LargeBinary)
+    tarball = Column(String)
+    docker_url = Column(String)
+    docker_log = Column(String)
     docker_size = Column(Integer)
-    built = Column(Boolean, default=False)
+    singularity_url = Column(String)
+    singularity_log = Column(String)
+    singularity_size = Column(Integer)
+    building = Column(String)
 
     builds = relationship('Build', back_populates='container')
 
@@ -47,62 +52,29 @@ class Build(Base):
     __tablename__ = 'builds'
 
     id = Column(String, primary_key=True)
-
     container_hash = Column(String, ForeignKey('containers.id'))
+    #user
 
     container = relationship('Container', back_populates='builds')
 
 
-def total_storage():
+@contextmanager
+def session_scope():
+    """Provide a transactional scope around a series of operations."""
     session = Session()
-    label = 'total_storage'
-    storage = session.query(Container).with_entities(func.sum(Container.docker_size).label(label)).scalar()
-    return storage or 0
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
-def hash_spec(spec):
-    tmp = spec.dict()
-    for k, v in tmp.items():
-        if v:
-            v.sort()
-    canonical = json.dumps(tmp, sort_keys=True)
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def store_spec(spec):
-    session = Session()
-    container_id = hash_spec(spec)
-
-    for row in session.query(Container).filter(Container.id == container_id):
-        return container_id, False
-
-    cont = Container()
-    cont.id = container_id
-    cont.last_used = datetime.now()
-    cont.specification = spec.json()
-    session.add(cont)
-    session.commit()
-    return container_id, True
-
-
-def get_spec(build_id):
-    session = Session()
-    for row in session.query(Build).filter(Build.id == build_id):
-        build = row
-        break
-    else:
-        raise HTTPException(status_code=404)
-
-    spec = build.container.specification
-    if not spec:
-        raise HTTPException(status_code=400)
-
-    return json.loads(spec)
-
-
-def hash_tarball(tarball):
+def hash_file(pth):
     digest = hashlib.sha256()
-    with open(tarball, 'rb') as f:
+    with open(pth, 'rb') as f:
         while True:
             data = f.read(65536)
             if not data:
@@ -111,115 +83,126 @@ def hash_tarball(tarball):
     return digest.hexdigest()
 
 
+def store_spec(spec):
+    container_id = spec.digest()
+
+    with session_scope() as session:
+        for row in session.query(Container).filter(Container.id == container_id):
+            return container_id
+
+        cont = Container()
+        cont.id = container_id
+        cont.last_used = datetime.now()
+        cont.specification = spec.json()
+        session.add(cont)
+
+    return container_id
+
+
 def store_tarball(tarball):
-    session = Session()
+    tarball.rollover()
+    container_id = hash_file(tarball.name) #SLOW
 
-    tmp_fd, tmp_path = tempfile.mkstemp()
-    os.close(tmp_fd)
-    with open(tmp_path, 'wb') as f:
-        shutil.copyfileobj(tarball, f)
-    container_id = hash_tarball(tmp_path)
+    with session_scope() as session:
+        for row in session.query(Container).filter(Container.id == container_id):
+            return container_id
 
-    for row in session.query(Container).filter(Container.id == container_id):
-        return container_id, tmp_path, False
+        cont = Container()
+        session.add(cont)
+        cont.id = container_id
+        cont.last_used = datetime.now()
 
-    #XXX upload to S3 or wherever here
-    # just stash it in the database for now
+        #XXX upload to S3 or wherever here
 
-    cont = Container()
-    cont.id = container_id
-    cont.last_used = datetime.now()
-    with open(tmp_path, 'rb') as f:
-        cont.tarball = f.read()
-    session.add(cont)
-    session.commit()
-    return container_id, tmp_path, True
+    return container_id
 
 
-def fetch_tarball(container_id):
-    session = Session()
-    container = session.query(Container).filter(Container.id == container_id).one()
-    if not container.tarball:
-        return
-    tmp_fd, tmp_path = tempfile.mkstemp()
-    os.close(tmp_fd)
-    with open(tmp_path, 'wb') as f:
-        f.write(container.tarball)
-    return tmp_path
+def get_spec(build_id):
+    with session_scope() as session:
+        for row in session.query(Build).filter(Build.id == build_id):
+            build = row
+            break
+        else:
+            raise HTTPException(status_code=404)
 
+        spec = build.container.specification
+        if not spec:
+            raise HTTPException(status_code=400)
 
-def status(build_id):
-    session = Session()
-    for row in session.query(Build).filter(Build.id == build_id):
-        build = row
-        break
-    else:
-        raise HTTPException(status_code=404)
-
-    out = StatusResponse(
-        id=build.id,
-        recipe_checksum=build.container.id,
-        docker_ready=bool(build.container.docker_size),
-        docker_size=build.container.docker_size,
-        last_used=build.container.last_used,
-        build_status = build.container.exit_status
-    )
-
-    return out
+        return json.loads(spec)
 
 
 def add_build(container_id):
-    session = Session()
-    build = Build()
-    build.id = str(uuid.uuid4())
-    build.container_hash = container_id
-    session.add(build)
-    session.commit()
+    with session_scope() as session:
+        build = Build()
+        build.id = str(uuid.uuid4())
+        build.container_hash = container_id
+        session.add(build)
+        session.commit()
 
-    build.container.last_used = datetime.now()
-    session.add(build)
-    session.commit()
-    return build.id
+        build.container.last_used = datetime.now()
+        session.add(build)
+        return build.id
 
 
-def start_build(container_id):
-    session = Session()
-    container = session.query(Container).filter(Container.id == container_id).one()
-    if container.built:
-        return False
-    container.built = True
-    session.commit()
-    return True
+def status(build_id):
+    with session_scope() as session:
+        for row in session.query(Build).filter(Build.id == build_id):
+            build = row
+            container = row.container
+            break
+        else:
+            raise HTTPException(status_code=404)
 
-def store_build_result(container_id, exit_status, build_log, docker_size):
-    session = Session()
-    container = session.query(Container).filter(Container.id == container_id).one()
-    container.exit_status = exit_status
-    container.docker_size = docker_size
-    with build_log.open('rb') as f:
-        #TODO either check length or upload to S3
-        container.build_log = f.read()
+        #check/update urls
 
-    session.commit()
-
-def get_build_output(build_id):
-    session = Session()
-    for row in session.query(Build).filter(Build.id == build_id):
-        build = row
-        break
-    else:
-        raise HTTPException(status_code=404)
-    return build.container.build_log
+        return StatusResponse(
+            id=build.id,
+            recipe_checksum=container.id,
+            last_used=container.last_used,
+            docker_url=container.docker_url,
+            docker_size=container.docker_size,
+            singularity_url=container.singularity_url,
+            singularity_size=container.singularity_size
+            )
 
 
 def docker_url(build_id):
-    session = Session()
-    for row in session.query(Build).filter(Build.id == build_id):
-        build = row
-        break
-    else:
-        raise HTTPException(status_code=404)
-    return build.container.id, 'TODO aws' if build.container.docker_size else None
+    with session_scope() as session:
+        for row in session.query(Build).filter(Build.id == build_id):
+            container = row.container
+            break
+        else:
+            raise HTTPException(status_code=404)
+        #check/update urls
+        if container.docker_log and not container.docker_url:
+            raise HTTPException(status_code=410)
+        return container.id, container.docker_url
+
+
+def singularity_url(build_id):
+    with session_scope() as session:
+        for row in session.query(Build).filter(Build.id == build_id):
+            container = row.container
+            break
+        else:
+            raise HTTPException(status_code=404)
+        #check/update urls
+        if container.singularity_log and not container.singularity_url:
+            raise HTTPException(status_code=410)
+        return container.id, container.singularity_url
+
+
+def start_build(container_id):
+    with session_scope() as session:
+        container = session.query(Container).filter(Container.id == container_id).populate_existing().with_for_update().one()
+        if container.building == RUN_ID:
+            return False
+        elif container.building is not None:
+            #clean up from crash
+            pass
+        container.building = RUN_ID
+    return True
 
 
 Base.metadata.create_all(_engine)

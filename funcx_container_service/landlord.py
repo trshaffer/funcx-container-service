@@ -37,6 +37,7 @@ def check_cache():
         session.commit()
 
 def find_existing(spec):
+    return
     session = db.Session()
 
     target = spec_to_set(spec)

@@ -13,23 +13,18 @@ from . import db, landlord
 from .models import ContainerSpec
 
 
-REPO2DOCKER_CMD = "jupyter-repo2docker --no-run --image-name funcx_{} {}"
+REPO2DOCKER_CMD = 'jupyter-repo2docker --no-run --image-name funcx_{} {}'
+SINGULARITY_CMD = 'singularity build {} docker-daemon://{}}'
 DOCKER_BASE_URL = 'unix://var/run/docker.sock'
 
 
 def docker_size(container_id):
     docker_client = docker.APIClient(base_url=DOCKER_BASE_URL)
-    inspect = docker_client.inspect_image(f'funcx_{container_id}')
-    return inspect['VirtualSize']
-
-
-def docker_ready(container_id):
-    docker_client = docker.APIClient(base_url=DOCKER_BASE_URL)
     try:
-        docker_client.inspect_image(f'funcx_{container_id}')
-        return True
+        inspect = docker_client.inspect_image(f'funcx_{container_id}')
+        return inspect['VirtualSize']
     except ImageNotFound:
-        return False
+        return None
 
 
 def env_from_spec(spec):
@@ -51,10 +46,10 @@ async def build_spec(container_id, spec, tmp_dir):
             f.writelines([x + '\n' for x in spec.apt])
     with (tmp_dir / 'environment.yml').open('w') as f:
         json.dump(env_from_spec(spec), f, indent=4)
-    await run_repo2docker(container_id, tmp_dir)
+    return await repo2docker_build(container_id, tmp_dir)
 
 
-async def build_tarball(container_id, tmp_dir, tarball):
+async def build_tarball(container_id, tarball, tmp_dir):
     with tarfile.open(tarball) as tar_obj:
         tar_obj.extractall(path=tmp_dir)
 
@@ -62,46 +57,61 @@ async def build_tarball(container_id, tmp_dir, tarball):
     if len(os.listdir(tmp_dir)) == 0:
         raise HTTPException(status_code=415, detail="Invalid tarball")
 
-    await run_repo2docker(container_id, tmp_dir)
+    return await repo2docker_build(container_id, tmp_dir)
 
 
-async def run_repo2docker(container_id, temp_dir):
+async def repo2docker_build(container_id, temp_dir):
     with tempfile.NamedTemporaryFile() as out:
         proc = await asyncio.create_subprocess_shell(
                 REPO2DOCKER_CMD.format(container_id, temp_dir),
                 stdout=out, stderr=out)
         await proc.communicate()
-        db.store_build_result(
-                container_id,
-                proc.returncode,
-                Path(out.name),
-                docker_size(container_id))
-        landlord.check_cache()
+        #push log and container
+    return ('docker_url', 'docker_log')
+
+
+async def singularity_build(container_id):
+    with tempfile.NamedTemporaryFile() as sif,
+            tempfile.NamedTemporaryFile() as out:
+        proc = await asyncio.create_subprocess_shell(
+                SINGULARITY_CMD.format(sif, f'funcx_{container_id}'),
+                stdout=out, stderr=out)
+        await proc.communicate()
+        #upload
+        return ('singularity_url', 'singularity_log', 'singularity_size')
 
 
 async def background_build(container_id, tarball):
-    session = db.Session()
-    container = session.query(db.Container).filter(db.Container.id == container_id).one()
+    if not db.start_build(container_id):
+        return
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        if container.specification and container.exit_status is None:
-            assert(not tarball)
-            await build_spec(
-                    container_id,
-                    ContainerSpec.parse_raw(container.specification),
-                    tmp)
-        elif container.tarball and container.exit_status is None:
-            assert(tarball)
-            await build_tarball(container_id, tmp, tarball)
+    with db.session_scope() as session:
+        container = session.query(db.Container).filter(db.Container.id == container_id).one()
+        try:
+            #check/update urls
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                if container.specification:
+                    assert(not tarball)
+                    (container.docker_url,
+                    container.docker_log) = await build_spec(
+                            container_id,
+                            ContainerSpec.parse_raw(container.specification),
+                            tmp)
+                elif container.tarball:
+                    (container.docker_url,
+                    container.docker_log) = await build_tarball(
+                            container_id,
+                            tarball,
+                            tmp)
+            container.docker_size = docker_size(container_id)
+            session.commit()
 
-    if tarball:
-        os.unlink(tarball)
+            #check/update urls
+            (container.singularity_url,
+            container.singularity_log,
+            container.singularity_size) = await singularity_build(container_id)
+        finally:
+            container.building = None
 
-
-def remove(container_id):
-    client = docker.from_env()
-    try:
-        client.images.remove(f'funcx_{container.id}')
-    except ImageNotFound:
-        logging.warning(f'docker image funcx_{container.id} removed unexpectedly')
+    landlord.cleanup()
